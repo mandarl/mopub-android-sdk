@@ -1,12 +1,9 @@
 package com.mopub.common;
 
 import android.app.Activity;
-import android.graphics.Bitmap;
-import android.support.v4.util.LruCache;
 
 import com.mopub.common.test.support.SdkTestRunner;
 
-import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -39,8 +36,6 @@ public class CacheServiceTest {
 
     @Before
     public void setUp() throws Exception {
-        CacheService.clearAndNullCaches();
-
         context = new Activity();
         key1 = "http://www.mopub.com/";
         data1 = "image_data_1";
@@ -59,24 +54,16 @@ public class CacheServiceTest {
         }).when(diskCacheGetListener).onComplete(anyString(), any(byte[].class));
     }
 
-    @After
-    public void tearDown() throws Exception {
-        CacheService.clearAndNullCaches();
-    }
-
     @Test
-    public void initializeCaches_withValidContext_shouldCreateNewCachesIdempotently() throws Exception {
+    public void initializeCache_withValidContext_shouldCreateNewCachesIdempotently() throws Exception {
         assertThat(CacheService.getDiskLruCache()).isNull();
 
         CacheService.initialize(context);
         DiskLruCache diskLruCache = CacheService.getDiskLruCache();
         assertThat(diskLruCache).isNotNull();
-        LruCache<String, Bitmap> memoryLruCache = CacheService.getBitmapLruCache();
-        assertThat(memoryLruCache).isNotNull();
 
         CacheService.initialize(context);
         assertThat(diskLruCache).isEqualTo(CacheService.getDiskLruCache());
-        assertThat(memoryLruCache).isEqualTo(CacheService.getBitmapLruCache());
     }
     
     @Test
@@ -165,8 +152,6 @@ public class CacheServiceTest {
     }
 
     public static void assertCachesAreEmpty() {
-        assertThat(CacheService.getBitmapLruCache()).isNotNull();
-        assertThat(CacheService.getBitmapLruCache().size()).isEqualTo(0);
         assertDiskCacheIsEmpty();
     }
 }

@@ -15,8 +15,8 @@ android {
     buildToolsVersion rootProject.buildToolsVersion
 
     defaultConfig {
-        versionCode 1
-        versionName "3.2.2"
+        versionCode 24
+        versionName "3.7.0"
         minSdkVersion rootProject.minSdkVersion
         targetSdkVersion rootProject.targetSdkVersion
         consumerProguardFiles 'proguard.txt'
@@ -48,12 +48,17 @@ android {
 }
 
 dependencies {
+    compile 'com.android.support:support-annotations:22.0.0'
+    compile 'com.mopub.volley:mopub-volley:1.1.0'
     compile rootProject.supportV4
     //compile rootProject.playServices
     compile rootProject.playServicesAds
     compile files('libs/MMSDK-5.4.0.jar')
 }
 
-// Don't run the Robolectric Unit Tests. They don't build properly in Gradle or Android Studio in this version.
+// Don't run the Robolectric Unit Tests.
 check.dependsOn.remove("test")
+check.dependsOn.remove("unitTest")
 check.dependsOn.remove("testDebug")
+check.dependsOn.remove("unitTestDebug")
+

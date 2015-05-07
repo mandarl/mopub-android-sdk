@@ -1,3 +1,7 @@
+repositories {
+    jcenter()
+}
+
 apply plugin: 'com.android.application'
 
 group = 'com.mopub'
@@ -5,14 +9,25 @@ group = 'com.mopub'
 description = '''MoPub SDK'''
 
 android {
-    compileSdkVersion 19
-    buildToolsVersion '19.1.0'
+    compileSdkVersion 22
+    buildToolsVersion '22.0.1'
 
     defaultConfig {
-        versionCode 1
-        versionName "3.2.1"
+        versionCode 24
+        versionName "3.7.0"
         minSdkVersion 9
-        targetSdkVersion 19
+        targetSdkVersion 22
+    }
+
+    buildTypes {
+      release {
+        minifyEnabled true
+        proguardFiles = [getDefaultProguardFile('proguard-android.txt'), 'proguard.cfg']
+      }
+      debug {
+        minifyEnabled true
+        proguardFiles = [getDefaultProguardFile('proguard-android.txt'), 'proguard.cfg']
+      }
     }
 
     sourceSets {
@@ -36,7 +51,7 @@ android {
 }
 
 dependencies {
-    compile 'com.android.support:support-v4:19.1.+'
-    compile 'com.google.android.gms:play-services:5.0.89'
+    compile 'com.android.support:support-v4:22.0.0'
+    compile 'com.google.android.gms:play-services-ads:7.0.0'
     compile project(':mopub-sdk')
 }

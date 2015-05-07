@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
 import android.media.MediaPlayer;
@@ -15,13 +16,20 @@ import android.view.ViewGroup;
 import android.webkit.WebView;
 import android.widget.ImageView;
 import android.widget.VideoView;
+
 import com.mopub.common.MoPubBrowser;
 import com.mopub.common.test.support.SdkTestRunner;
+import com.mopub.common.util.DeviceUtils.ForceOrientation;
 import com.mopub.common.util.Dips;
 import com.mopub.common.util.Drawables;
+import com.mopub.mobileads.resource.CloseButtonDrawable;
 import com.mopub.mobileads.test.support.GestureUtils;
 import com.mopub.mobileads.util.vast.VastCompanionAd;
 import com.mopub.mobileads.util.vast.VastVideoConfiguration;
+import com.mopub.network.MaxWidthImageLoader;
+import com.mopub.network.MoPubRequestQueue;
+import com.mopub.network.Networking;
+
 import org.apache.http.HttpRequest;
 import org.apache.maven.artifact.ant.shaded.ReflectionUtils;
 import org.junit.After;
@@ -30,6 +38,7 @@ import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
 import org.robolectric.Robolectric;
 import org.robolectric.annotation.Config;
 import org.robolectric.shadows.ShadowLocalBroadcastManager;
@@ -37,14 +46,18 @@ import org.robolectric.shadows.ShadowVideoView;
 import org.robolectric.tester.org.apache.http.RequestMatcher;
 import org.robolectric.tester.org.apache.http.TestHttpResponse;
 
-import java.io.*;
-import java.util.*;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
 
-import static android.media.MediaPlayer.OnPreparedListener;
+import static android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+import static android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
 import static android.view.ViewGroup.LayoutParams.MATCH_PARENT;
 import static com.mopub.common.MoPubBrowser.DESTINATION_URL_KEY;
-import static com.mopub.common.util.test.support.CommonUtils.assertHttpRequestsMade;
+import static com.mopub.common.VolleyRequestMatcher.isUrl;
+import static com.mopub.common.util.ResponseHeader.USER_AGENT;
 import static com.mopub.mobileads.BaseVideoViewController.BaseVideoViewControllerListener;
+import static com.mopub.mobileads.EventForwardingBroadcastReceiver.ACTION_INTERSTITIAL_CLICK;
 import static com.mopub.mobileads.EventForwardingBroadcastReceiver.ACTION_INTERSTITIAL_DISMISS;
 import static com.mopub.mobileads.EventForwardingBroadcastReceiver.ACTION_INTERSTITIAL_FAIL;
 import static com.mopub.mobileads.EventForwardingBroadcastReceiver.ACTION_INTERSTITIAL_SHOW;
@@ -53,21 +66,33 @@ import static com.mopub.mobileads.EventForwardingBroadcastReceiverTest.getIntent
 import static com.mopub.mobileads.VastVideoViewController.DEFAULT_VIDEO_DURATION_FOR_CLOSE_BUTTON;
 import static com.mopub.mobileads.VastVideoViewController.MAX_VIDEO_DURATION_FOR_CLOSE_BUTTON;
 import static com.mopub.mobileads.VastVideoViewController.VAST_VIDEO_CONFIGURATION;
+import static com.mopub.volley.toolbox.ImageLoader.ImageListener;
 import static org.fest.assertions.api.Assertions.assertThat;
 import static org.junit.Assert.fail;
 import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyInt;
+import static org.mockito.Matchers.argThat;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.stub;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.robolectric.Robolectric.shadowOf;
 
+@Config(manifest = Config.NONE)
 @RunWith(SdkTestRunner.class)
 public class VastVideoViewControllerTest {
-    public static final int NETWORK_DELAY = 500;
-    private MediaPlayer mediaPlayer;
+    public static final int NETWORK_DELAY = 100;
+
+    private static final String COMPANION_IMAGE_URL = "companion_image_url";
+    private static final String COMPANION_CLICK_TRACKING_URL_1 = "companion_click_tracking_url_1";
+    private static final String COMPANION_CLICK_TRACKING_URL_2 = "companion_click_tracking_url_2";
+    private static final String COMPANION_CLICK_DESTINATION_URL = "http://companion_click_destination_url";
+    private static final String CLICKTHROUGH_URL = "http://clickthrough_url";
+
     private Context context;
     private Bundle bundle;
     private long testBroadcastIdentifier;
@@ -77,9 +102,17 @@ public class VastVideoViewControllerTest {
     private int expectedBrowserRequestCode;
     private String expectedUserAgent;
 
+    @Mock
+    MoPubRequestQueue mockRequestQueue;
+    @Mock
+    MaxWidthImageLoader mockImageLoader;
+    @Mock
+    private MediaPlayer mockMediaPlayer;
+
     @Before
     public void setUp() throws Exception {
-        mediaPlayer = mock(MediaPlayer.class);
+        Networking.setRequestQueueForTesting(mockRequestQueue);
+        Networking.setImageLoaderForTesting(mockImageLoader);
         context = new Activity();
         bundle = new Bundle();
         testBroadcastIdentifier = 1111;
@@ -89,21 +122,22 @@ public class VastVideoViewControllerTest {
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setNetworkMediaFileUrl("video_url");
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
-        vastVideoConfiguration.addStartTrackers(Arrays.asList("start"));
-        vastVideoConfiguration.addFirstQuartileTrackers(Arrays.asList("first"));
-        vastVideoConfiguration.addMidpointTrackers(Arrays.asList("mid"));
-        vastVideoConfiguration.addThirdQuartileTrackers(Arrays.asList("third"));
+        vastVideoConfiguration.addAbsoluteTrackers(Arrays.asList(new VastAbsoluteProgressTracker("start", 2000)));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("first", 0.25f),
+                new VastFractionalProgressTracker("mid", 0.5f), new VastFractionalProgressTracker("third", 0.75f)));
         vastVideoConfiguration.addCompleteTrackers(Arrays.asList("complete"));
+        vastVideoConfiguration.addCloseTrackers(Arrays.asList("close"));
+        vastVideoConfiguration.addSkipTrackers(Arrays.asList("skip"));
         vastVideoConfiguration.addImpressionTrackers(Arrays.asList("imp"));
-        vastVideoConfiguration.setClickThroughUrl("clickThrough");
+        vastVideoConfiguration.setClickThroughUrl(CLICKTHROUGH_URL);
         vastVideoConfiguration.addClickTrackers(Arrays.asList("click_1", "click_2"));
 
         VastCompanionAd vastCompanionAd = new VastCompanionAd(
                 300,
                 250,
-                "companion_image_url",
-                "companion_click_destination_url",
-                new ArrayList<String>(Arrays.asList("companion_click_tracking_url_1", "companion_click_tracking_url_2"))
+                COMPANION_IMAGE_URL,
+                COMPANION_CLICK_DESTINATION_URL,
+                new ArrayList<String>(Arrays.asList(COMPANION_CLICK_TRACKING_URL_1, COMPANION_CLICK_TRACKING_URL_2))
         );
         vastVideoConfiguration.setVastCompanionAd(vastCompanionAd);
 
@@ -115,6 +149,7 @@ public class VastVideoViewControllerTest {
         Robolectric.getBackgroundScheduler().pause();
         Robolectric.clearPendingHttpResponses();
 
+        // Used to give responses to Vast Download Tasks.
         Robolectric.addHttpResponseRule(new RequestMatcher() {
             @Override
             public boolean matches(HttpRequest request) {
@@ -131,30 +166,8 @@ public class VastVideoViewControllerTest {
     public void tearDown() throws Exception {
         Robolectric.getUiThreadScheduler().reset();
         Robolectric.getBackgroundScheduler().reset();
-        Robolectric.clearPendingHttpResponses();
 
         ShadowLocalBroadcastManager.getInstance(context).unregisterReceiver(broadcastReceiver);
-    }
-
-    @Test
-    public void constructor_shouldPingImpressionTrackers() throws Exception {
-        // XXX this test needs to be at the top of the constructor tests since it checks for async
-        // http requests. If it's below any other constructor tests, there is a chance outstanding
-        // async requests will not run until this tests starts, thus polluting the http requests
-
-        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
-        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
-        vastVideoConfiguration.addStartTrackers(Arrays.asList("start"));
-        vastVideoConfiguration.addImpressionTrackers(Arrays.asList("imp"));
-        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
-
-        initializeSubject();
-
-        Robolectric.getUiThreadScheduler().unPause();
-        Robolectric.getBackgroundScheduler().unPause();
-        Thread.sleep(NETWORK_DELAY);
-
-        assertHttpRequestsMade(expectedUserAgent, "imp");
     }
 
     @Test
@@ -197,14 +210,15 @@ public class VastVideoViewControllerTest {
         initializeSubject();
         ViewGroup viewGroup = subject.getLayout();
         LayerDrawable layerDrawable = (LayerDrawable) viewGroup.getBackground();
-        assertThat(layerDrawable.getDrawable(0)).isEqualTo(Drawables.THATCHED_BACKGROUND.decodeImage(context));
+        assertThat(layerDrawable.getDrawable(0)).isEqualTo(Drawables.THATCHED_BACKGROUND.createDrawable(
+                context));
         assertThat(layerDrawable.getDrawable(1)).isEqualTo(
                 new GradientDrawable(
                         GradientDrawable.Orientation.TOP_BOTTOM,
                         new int[]{Color.argb(0, 0, 0, 0), Color.argb(255, 0, 0, 0)})
         );
     }
-    
+
     @Test
     public void constructor_withMissingVastVideoConfiguration_shouldThrowIllegalStateException() throws Exception {
         bundle.clear();
@@ -228,15 +242,75 @@ public class VastVideoViewControllerTest {
     }
 
     @Test
-    public void onCreate_shouldBroadcastInterstitialShow() throws Exception {
-        Intent expectedIntent = getIntentForActionAndIdentifier(ACTION_INTERSTITIAL_SHOW, testBroadcastIdentifier);
+    public void constructor_whenCustomCtaTextNotSpecified_shouldUseDefaultCtaText() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
         initializeSubject();
 
-        subject.onCreate();
-        Robolectric.getUiThreadScheduler().unPause();
+        assertThat(getVastVideoToolbar().getLearnMoreWidget().getTextViewText()).isEqualTo("Learn More");
+    }
 
-        verify(broadcastReceiver).onReceive(any(Context.class), eq(expectedIntent));
+    @Test
+    public void constructor_whenCustomCtaTextSpecified_shouldUseCustomCtaText() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setCustomCtaText("custom CTA text");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        assertThat(getVastVideoToolbar().getLearnMoreWidget().getTextViewText()).isEqualTo("custom CTA text");
+    }
+
+    @Test
+    public void constructor_whenCustomSkipTextNotSpecified_shouldUseDefaultSkipText() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        assertThat(getVastVideoToolbar().getCloseButtonWidget().getTextViewText()).isEqualTo("Close");
+    }
+
+    @Test
+    public void constructor_whenCustomSkipTextSpecified_shouldUseCustomSkipText() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setCustomSkipText("custom skip text");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        assertThat(getVastVideoToolbar().getCloseButtonWidget().getTextViewText()).isEqualTo("custom skip text");
+    }
+
+    @Test
+    public void constructor_whenCustomCloseIconNotSpecified_shouldUseDefaultCloseIcon() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        Drawable imageViewDrawable = getVastVideoToolbar().getCloseButtonWidget().getImageViewDrawable();
+
+        // Default close icon is an instance of CloseButtonDrawable
+        assertThat(imageViewDrawable).isInstanceOf(CloseButtonDrawable.class);
+    }
+
+    @Test
+    public void constructor_whenCustomCloseIconSpecified_shouldUseCustomCloseIcon() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setCustomCloseIconUrl("http://ton.twitter.com/exchange-media/images/v4/star_icon_3x_1.png");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        verify(mockImageLoader).get(eq("http://ton.twitter.com/exchange-media/images/v4/star_icon_3x_1.png"), any(ImageListener.class));
     }
 
     @Test
@@ -252,6 +326,76 @@ public class VastVideoViewControllerTest {
         Thread.sleep(NETWORK_DELAY);
 
         assertThat(shadowOf(((BitmapDrawable) imageView.getDrawable()).getBitmap()).getCreatedFromBytes()).isEqualTo("body".getBytes());
+    }
+
+    @Test
+    public void onCreate_shouldFireImpressionTracker() throws Exception {
+        initializeSubject();
+
+        subject.onCreate();
+        verify(mockRequestQueue).add(argThat(isUrl("imp")));
+    }
+
+    @Test
+    public void onCreate_shouldBroadcastInterstitialShow() throws Exception {
+        Intent expectedIntent = getIntentForActionAndIdentifier(ACTION_INTERSTITIAL_SHOW, testBroadcastIdentifier);
+
+        initializeSubject();
+
+        Robolectric.getUiThreadScheduler().unPause();
+        subject.onCreate();
+        verify(broadcastReceiver).onReceive(any(Context.class), eq(expectedIntent));
+    }
+
+    @Test
+    public void onCreate_whenCustomForceOrientationNotSpecified_shouldForceLandscapeOrientation() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+        subject.onCreate();
+
+        verify(baseVideoViewControllerListener).onSetRequestedOrientation(SCREEN_ORIENTATION_LANDSCAPE);
+    }
+
+    @Test
+    public void onCreate_whenCustomForceOrientationIsDeviceOrientation_shouldNotForceLandscapeOrientation() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setCustomForceOrientation(ForceOrientation.DEVICE_ORIENTATION);
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+        subject.onCreate();
+
+        verify(baseVideoViewControllerListener, never()).onSetRequestedOrientation(anyInt());
+    }
+
+    @Test
+    public void onCreate_whenCustomForceOrientationIsPortraitOrientation_shouldForcePortraitOrientation() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setCustomForceOrientation(ForceOrientation.FORCE_PORTRAIT);
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+        subject.onCreate();
+
+        verify(baseVideoViewControllerListener).onSetRequestedOrientation(SCREEN_ORIENTATION_PORTRAIT);
+    }
+
+    @Test
+    public void onCreate_whenCustomForceOrientationIsLandscapeOrientation_shouldForceLandscapeOrientation() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setCustomForceOrientation(ForceOrientation.FORCE_LANDSCAPE);
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+        subject.onCreate();
+
+        verify(baseVideoViewControllerListener).onSetRequestedOrientation(SCREEN_ORIENTATION_LANDSCAPE);
     }
 
     @Test
@@ -279,15 +423,12 @@ public class VastVideoViewControllerTest {
         Thread.sleep(NETWORK_DELAY);
 
         assertThat(imageView.performClick()).isTrue();
-        Thread.sleep(NETWORK_DELAY);
 
-        assertHttpRequestsMade(
-                expectedUserAgent,
-                "companion_image_url",
-                "imp",
-                "companion_click_tracking_url_1",
-                "companion_click_tracking_url_2"
-        );
+        // This request is still made by the older http stack.
+        assertHttpRequestsMade(expectedUserAgent, COMPANION_IMAGE_URL);
+
+        verify(mockRequestQueue).add(argThat(isUrl(COMPANION_CLICK_TRACKING_URL_1)));
+        verify(mockRequestQueue).add(argThat(isUrl(COMPANION_CLICK_TRACKING_URL_2)));
 
         ArgumentCaptor<Bundle> bundleCaptor = ArgumentCaptor.forClass(Bundle.class);
         verify(baseVideoViewControllerListener).onStartActivityForResult(
@@ -296,7 +437,7 @@ public class VastVideoViewControllerTest {
                 bundleCaptor.capture()
         );
 
-        assertThat(bundleCaptor.getValue().get(DESTINATION_URL_KEY)).isEqualTo("companion_click_destination_url");
+        assertThat(bundleCaptor.getValue().get(DESTINATION_URL_KEY)).isEqualTo(COMPANION_CLICK_DESTINATION_URL);
     }
 
     @Test
@@ -345,14 +486,13 @@ public class VastVideoViewControllerTest {
         verify(baseVideoViewControllerListener, never()).onFinish();
     }
 
-
     @Test
     public void onTouch_withTouchUp_whenVideoLessThan16Seconds_andClickBeforeEnd_shouldDoNothing() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(15999);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(15990);
+        stub(mockMediaPlayer.getDuration()).toReturn(15999);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(15990);
 
         initializeSubject();
-        setMediaPlayer(mediaPlayer);
+        setMockMediaPlayer(mockMediaPlayer);
         getShadowVideoView().getOnPreparedListener().onPrepared(null);
 
         Robolectric.getUiThreadScheduler().unPause();
@@ -365,13 +505,13 @@ public class VastVideoViewControllerTest {
 
     @Test
     public void onTouch_withTouchUp_whenVideoLessThan16Seconds_andClickAfterEnd_shouldStartMoPubBrowser() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(15999);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(16000);
+        stub(mockMediaPlayer.getDuration()).toReturn(15999);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(15999);
 
         initializeSubject();
         subject.onResume();
 
-        setMediaPlayer(mediaPlayer);
+        setMockMediaPlayer(mockMediaPlayer);
         getShadowVideoView().getOnPreparedListener().onPrepared(null);
 
         Robolectric.getUiThreadScheduler().unPause();
@@ -385,18 +525,18 @@ public class VastVideoViewControllerTest {
                 bundleCaptor.capture()
         );
 
-        assertThat(bundleCaptor.getValue().get(DESTINATION_URL_KEY)).isEqualTo("clickThrough");
+        assertThat(bundleCaptor.getValue().get(DESTINATION_URL_KEY)).isEqualTo(CLICKTHROUGH_URL);
     }
 
     @Test
     public void onTouch_withTouchUp_whenVideoLongerThan16Seconds_andClickBefore5Seconds_shouldDoNothing() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(100000);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(4999);
+        stub(mockMediaPlayer.getDuration()).toReturn(100000);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(4999);
 
         initializeSubject();
         subject.onResume();
 
-        setMediaPlayer(mediaPlayer);
+        setMockMediaPlayer(mockMediaPlayer);
         getShadowVideoView().getOnPreparedListener().onPrepared(null);
 
         Robolectric.getUiThreadScheduler().unPause();
@@ -409,13 +549,13 @@ public class VastVideoViewControllerTest {
 
     @Test
     public void onTouch_withTouchUp_whenVideoLongerThan16Seconds_andClickAfter5Seconds_shouldStartMoPubBrowser() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(100000);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(5001);
+        stub(mockMediaPlayer.getDuration()).toReturn(100000);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(5001);
 
         initializeSubject();
         subject.onResume();
 
-        setMediaPlayer(mediaPlayer);
+        setMockMediaPlayer(mockMediaPlayer);
         getShadowVideoView().getOnPreparedListener().onPrepared(null);
 
         Robolectric.getUiThreadScheduler().unPause();
@@ -429,7 +569,7 @@ public class VastVideoViewControllerTest {
                 bundleCaptor.capture()
         );
 
-        assertThat(bundleCaptor.getValue().get(DESTINATION_URL_KEY)).isEqualTo("clickThrough");
+        assertThat(bundleCaptor.getValue().get(DESTINATION_URL_KEY)).isEqualTo(CLICKTHROUGH_URL);
     }
 
     @Test
@@ -444,11 +584,8 @@ public class VastVideoViewControllerTest {
         subject.setCloseButtonVisible(true);
 
         getShadowVideoView().getOnTouchListener().onTouch(null, GestureUtils.createActionUp(0, 0));
-        Robolectric.getUiThreadScheduler().unPause();
-        Robolectric.getBackgroundScheduler().unPause();
-        Thread.sleep(NETWORK_DELAY);
-
-        assertHttpRequestsMade(expectedUserAgent, "click_1", "click_2");
+        verify(mockRequestQueue).add(argThat(isUrl("click_1")));
+        verify(mockRequestQueue).add(argThat(isUrl("click_2")));
     }
 
     @Test
@@ -463,9 +600,6 @@ public class VastVideoViewControllerTest {
         subject.setCloseButtonVisible(false);
 
         getShadowVideoView().getOnTouchListener().onTouch(null, GestureUtils.createActionUp(0, 0));
-        Robolectric.getBackgroundScheduler().unPause();
-        Thread.sleep(NETWORK_DELAY);
-
         assertThat(Robolectric.httpRequestWasMade()).isFalse();
     }
 
@@ -493,13 +627,10 @@ public class VastVideoViewControllerTest {
     public void onPrepared_whenDurationIsLessThanMaxVideoDurationForCloseButton_shouldSetShowCloseButtonDelayToDuration() throws Exception {
         initializeSubject();
 
-        stub(mediaPlayer.getDuration()).toReturn(1000);
-        setMediaPlayer(mediaPlayer);
+        stub(mockMediaPlayer.getDuration()).toReturn(1000);
+        setMockMediaPlayer(mockMediaPlayer);
 
-        // this callback is typically called when the media filed is loaded and ready to play
-        // invoke this manually since we are using a mock url and don't want to wait
-        final OnPreparedListener onPreparedListener = getShadowVideoView().getOnPreparedListener();
-        onPreparedListener.onPrepared(null);
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
 
         assertThat(subject.getShowCloseButtonDelay()).isEqualTo(1000);
     }
@@ -508,12 +639,210 @@ public class VastVideoViewControllerTest {
     public void onPrepared_whenDurationIsGreaterThanMaxVideoDurationForCloseButton_shouldNotSetShowCloseButtonDelay() throws Exception {
         initializeSubject();
 
-        stub(mediaPlayer.getDuration()).toReturn(MAX_VIDEO_DURATION_FOR_CLOSE_BUTTON + 1);
-        setMediaPlayer(mediaPlayer);
+        stub(mockMediaPlayer.getDuration()).toReturn(MAX_VIDEO_DURATION_FOR_CLOSE_BUTTON + 1);
+        setMockMediaPlayer(mockMediaPlayer);
 
         getShadowVideoView().getOnPreparedListener().onPrepared(null);
 
         assertThat(subject.getShowCloseButtonDelay()).isEqualTo(DEFAULT_VIDEO_DURATION_FOR_CLOSE_BUTTON);
+    }
+
+    @Test
+    public void onPrepared_whenPercentSkipOffsetSpecified_shouldSetShowCloseButtonDelayToSkipOffset() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("25%");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(10 * 1000);
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(2500);
+        assertThat(subject.getHasSkipOffset()).isTrue();
+    }
+
+    @Test
+    public void onPrepared_whenAbsoluteSkipOffsetSpecified_shouldSetShowCloseButtonDelayToSkipOffset() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("00:00:03");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(10 * 1000);
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(3000);
+        assertThat(subject.getHasSkipOffset()).isTrue();
+    }
+
+    @Test
+    public void onPrepared_whenAbsoluteSkipOffsetWithMillisecondsSpecified_shouldSetShowCloseButtonDelayToSkipOffset() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("00:00:03.141");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(10 * 1000);
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(3141);
+        assertThat(subject.getHasSkipOffset()).isTrue();
+    }
+
+    @Test
+    public void onPrepared_whenSkipOffsetIsNull_shouldNotSetShowCloseButtonDelay() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset(null);
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(MAX_VIDEO_DURATION_FOR_CLOSE_BUTTON + 1);
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(DEFAULT_VIDEO_DURATION_FOR_CLOSE_BUTTON);
+        assertThat(subject.getHasSkipOffset()).isFalse();
+    }
+
+    @Test
+    public void onPrepared_whenSkipOffsetHasInvalidAbsoluteFormat_shouldNotSetShowCloseButtonDelay() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("123:4:56.7");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(MAX_VIDEO_DURATION_FOR_CLOSE_BUTTON + 1);
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(DEFAULT_VIDEO_DURATION_FOR_CLOSE_BUTTON);
+        assertThat(subject.getHasSkipOffset()).isFalse();
+    }
+
+    @Test
+    public void onPrepared_whenSkipOffsetHasInvalidPercentFormat_shouldNotSetShowCloseButtonDelay() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("101%");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(MAX_VIDEO_DURATION_FOR_CLOSE_BUTTON + 1);
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(DEFAULT_VIDEO_DURATION_FOR_CLOSE_BUTTON);
+        assertThat(subject.getHasSkipOffset()).isFalse();
+    }
+
+    @Test
+    public void onPrepared_whenSkipOffsetHasInvalidFractionalPercentFormat_shouldNotSetShowCloseButtonDelay() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("3.14%");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(MAX_VIDEO_DURATION_FOR_CLOSE_BUTTON + 1);
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(DEFAULT_VIDEO_DURATION_FOR_CLOSE_BUTTON);
+        assertThat(subject.getHasSkipOffset()).isFalse();
+    }
+
+    @Test
+    public void onPrepared_whenSkipOffsetIsNegative_shouldNotSetShowCloseButtonDelay() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("-00:00:03");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(MAX_VIDEO_DURATION_FOR_CLOSE_BUTTON + 1);
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(DEFAULT_VIDEO_DURATION_FOR_CLOSE_BUTTON);
+        assertThat(subject.getHasSkipOffset()).isFalse();
+    }
+
+    @Test
+    public void onPrepared_whenSkipOffsetIsZero_shouldSetShowCloseButtonDelayToZero() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("00:00:00");
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(MAX_VIDEO_DURATION_FOR_CLOSE_BUTTON + 1);
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(0);
+        assertThat(subject.getHasSkipOffset()).isTrue();
+    }
+
+    @Test
+    public void onPrepared_whenSkipOffsetIsLongerThanDurationForShortVideo_shouldNotSetShowCloseButtonDelay() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("00:00:11");   // 11s
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(10 * 1000);    // 10s: short video
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(10 * 1000);
+        assertThat(subject.getHasSkipOffset()).isFalse();
+    }
+
+    @Test
+    public void onPrepared_whenSkipOffsetIsLongerThanDurationForLongVideo_shouldNotSetShowCloseButtonDelay() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("00:00:21");   // 21s
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        stub(mockMediaPlayer.getDuration()).toReturn(20 * 1000);    // 20s: long video
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(DEFAULT_VIDEO_DURATION_FOR_CLOSE_BUTTON);
+        assertThat(subject.getHasSkipOffset()).isFalse();
     }
 
     @Test
@@ -526,21 +855,57 @@ public class VastVideoViewControllerTest {
     }
 
     @Test
-    public void onCompletion_shouldPingCompletionTrackers() throws Exception {
+    public void onCompletion_whenAllTrackersTracked_whenNoPlaybackErrors_shouldPingCompletionTrackersOnlyOnce() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        VastAbsoluteProgressTracker testTracker = new VastAbsoluteProgressTracker("testUrl", 123);
+        vastVideoConfiguration.addAbsoluteTrackers(Arrays.asList(testTracker));
+        vastVideoConfiguration.addCompleteTrackers(Arrays.asList("complete_1", "complete_2"));
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+        testTracker.setTracked();
+
+        getShadowVideoView().getOnCompletionListener().onCompletion(null);
+        verify(mockRequestQueue).add(argThat(isUrl("complete_1")));
+        verify(mockRequestQueue).add(argThat(isUrl("complete_2")));
+
+        // Completion trackers should still only be hit once
+        getShadowVideoView().getOnCompletionListener().onCompletion(null);
+        verify(mockRequestQueue).add(argThat(isUrl("complete_1")));
+        verify(mockRequestQueue).add(argThat(isUrl("complete_2")));
+    }
+
+    @Test
+    public void onCompletion_whenSomeTrackersRemain_shouldNotPingCompletionTrackers() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.addCompleteTrackers(Arrays.asList("complete_1", "complete_2"));
+        VastAbsoluteProgressTracker testTracker = new VastAbsoluteProgressTracker("testUrl", 123);
+        // Never track the testTracker, so completion trackers should not be fired.
+        vastVideoConfiguration.addAbsoluteTrackers(Arrays.asList(testTracker));
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        initializeSubject();
+
+        getShadowVideoView().getOnCompletionListener().onCompletion(null);
+        verify(mockRequestQueue, never()).add(argThat(isUrl("complete_1")));
+        verify(mockRequestQueue, never()).add(argThat(isUrl("complete_2")));
+    }
+
+    @Test
+    public void onCompletion_whenPlaybackError_shouldNotPingCompletionTrackers() throws Exception {
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
         vastVideoConfiguration.addCompleteTrackers(Arrays.asList("complete_1", "complete_2"));
         bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
         initializeSubject();
+        subject.setVideoError();
 
         getShadowVideoView().getOnCompletionListener().onCompletion(null);
-
-        Robolectric.getUiThreadScheduler().unPause();
-        Robolectric.getBackgroundScheduler().unPause();
-        Thread.sleep(NETWORK_DELAY);
-
-        assertHttpRequestsMade(expectedUserAgent, "complete_1", "complete_2");
+        verify(mockRequestQueue, never()).add(argThat(isUrl("complete_1")));
+        verify(mockRequestQueue, never()).add(argThat(isUrl("complete_2")));
     }
 
     @Test
@@ -613,6 +978,7 @@ public class VastVideoViewControllerTest {
 
         assertThat(result).isFalse();
         verify(broadcastReceiver).onReceive(any(Context.class), eq(expectedIntent));
+        assertThat(subject.getVideoError()).isTrue();
     }
 
     @Test
@@ -725,220 +1091,261 @@ public class VastVideoViewControllerTest {
     }
 
     @Test
+    public void handleClick_shouldMakeRequestsToClickTrackingUrls() {
+        initializeSubject();
+        subject.handleClick(Arrays.asList("clicktracker1", "clicktracker2"), CLICKTHROUGH_URL);
+
+        verify(mockRequestQueue).add(argThat(isUrl("clicktracker1")));
+        verify(mockRequestQueue).add(argThat(isUrl("clicktracker2")));
+    }
+
+    @Test
+    public void handleClick_withNullClickTrackers_shouldNotThrowAnException() {
+        initializeSubject();
+        subject.handleClick(null, CLICKTHROUGH_URL);
+
+        // pass
+    }
+
+    @Test
+    public void handleClick_withNullClickThroughUrl_shouldNotBroadcastClickOrOpenNewActivity() {
+        Intent expectedIntent = getIntentForActionAndIdentifier(ACTION_INTERSTITIAL_CLICK, testBroadcastIdentifier);
+
+        initializeSubject();
+        subject.handleClick(Arrays.asList("clicktracker"), null);
+
+        Robolectric.getUiThreadScheduler().unPause();
+        verify(broadcastReceiver, never()).onReceive(any(Context.class), eq(expectedIntent));
+        assertThat(Robolectric.getShadowApplication().getNextStartedActivity()).isNull();
+    }
+
+    @Test
+    public void handleClick_withMoPubNativeBrowserClickThroughUrl_shouldOpenExternalBrowser() {
+        initializeSubject();
+
+        subject.handleClick(Arrays.asList("clicktracker"),
+                "mopubnativebrowser://navigate?url=http%3A%2F%2Fwww.mopub.com");
+
+        Intent intent = Robolectric.getShadowApplication().getNextStartedActivity();
+        assertThat(intent.getDataString()).isEqualTo("http://www.mopub.com");
+        assertThat(intent.getAction()).isEqualTo(Intent.ACTION_VIEW);
+    }
+
+    @Test
+    public void handleClick_withMalformedMoPubNativeBrowserClickThroughUrl_shouldNotOpenANewActivity() {
+        initializeSubject();
+
+        // url2 is an invalid query parameter
+        subject.handleClick(Arrays.asList("clicktracker"),
+                "mopubnativebrowser://navigate?url2=http%3A%2F%2Fwww.mopub.com");
+
+        assertThat(Robolectric.getShadowApplication().getNextStartedActivity()).isNull();
+    }
+
+    @Test
+    public void handleClick_withAboutBlankClickThroughUrl_shouldFailSilently() {
+        initializeSubject();
+
+        subject.handleClick(Arrays.asList("clicktracker"), "about:blank");
+
+        assertThat(Robolectric.getShadowApplication().getNextStartedActivity()).isNull();
+    }
+
+    @Test
     public void videoProgressCheckerRunnableRun_shouldFireOffAllProgressTrackers() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(9001);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(9002);
+        stub(mockMediaPlayer.getDuration()).toReturn(9002);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(9002);
 
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
-        vastVideoConfiguration.addFirstQuartileTrackers(Arrays.asList("first"));
-        vastVideoConfiguration.addMidpointTrackers(Arrays.asList("second"));
-        vastVideoConfiguration.addThirdQuartileTrackers(Arrays.asList("third"));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("first", 0.25f),
+                new VastFractionalProgressTracker("second", 0.5f),
+                new VastFractionalProgressTracker("third", 0.75f)));
+
         bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
         initializeSubject();
         subject.onResume();
-        setMediaPlayer(mediaPlayer);
+        setMockMediaPlayer(mockMediaPlayer);
 
         // this runs the videoProgressChecker
         Robolectric.getUiThreadScheduler().unPause();
-        Robolectric.getBackgroundScheduler().unPause();
-        Thread.sleep(NETWORK_DELAY);
 
-        assertHttpRequestsMade(expectedUserAgent, "first", "second", "third");
+        verify(mockRequestQueue).add(argThat(isUrl("first")));
+        verify(mockRequestQueue).add(argThat(isUrl("second")));
+        verify(mockRequestQueue).add(argThat(isUrl("third")));
     }
 
     @Test
     public void videoProgressCheckerRunnableRun_whenDurationIsInvalid_shouldNotMakeAnyNetworkCalls() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(0);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(100);
+        stub(mockMediaPlayer.getDuration()).toReturn(0);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(100);
 
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
         bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
         initializeSubject();
-        setMediaPlayer(mediaPlayer);
+        setMockMediaPlayer(mockMediaPlayer);
         subject.onResume();
-        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(2);
+        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
 
         Robolectric.getUiThreadScheduler().runOneTask();
         // make sure the repeated task hasn't run yet
         assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
-
-        Thread.sleep(NETWORK_DELAY);
-
-        assertThat(Robolectric.httpRequestWasMade()).isFalse();
+        verifyZeroInteractions(mockRequestQueue);
     }
 
     @Test
-    public void videoProgressCheckerRunnableRun_whenCurrentTimeLessThanOneSecond_shouldNotFireStartTracker() throws Exception {
+    public void videoProgressCheckerRunnableRun_whenCurrentTimeLessThanTwoSeconds_shouldNotFireStartTracker() throws Exception {
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
-        vastVideoConfiguration.addStartTrackers(Arrays.asList("start"));
+        vastVideoConfiguration.addAbsoluteTrackers(Arrays.asList(new VastAbsoluteProgressTracker("start", 2000)));
         bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
-        stub(mediaPlayer.getDuration()).toReturn(100000);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(999);
+        stub(mockMediaPlayer.getDuration()).toReturn(100000);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(1999);
 
         initializeSubject();
         subject.onResume();
-        setMediaPlayer(mediaPlayer);
-        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(2);
+        setMockMediaPlayer(mockMediaPlayer);
+        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
 
         Robolectric.getUiThreadScheduler().runOneTask();
         // make sure the repeated task hasn't run yet
         assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
-
-        Thread.sleep(NETWORK_DELAY);
 
         // Since it has not yet been a second, we expect that the start tracker has not been fired
-        assertHttpRequestsMade(expectedUserAgent);
-        Robolectric.getFakeHttpLayer().clearRequestInfos();
+        verifyZeroInteractions(mockRequestQueue);
 
         // run checker another time
         assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
         Robolectric.getUiThreadScheduler().runOneTask();
 
-        Thread.sleep(NETWORK_DELAY);
-
-        assertThat(Robolectric.httpRequestWasMade()).isFalse();
+        verifyZeroInteractions(mockRequestQueue);
     }
 
     @Test
-    public void videoProgressCheckerRunnableRun_whenCurrentTimeGreaterThanOneSecond_shouldFireStartTracker() throws Exception {
+    public void videoProgressCheckerRunnableRun_whenCurrentTimeGreaterThanTwoSeconds_shouldFireStartTracker() throws Exception {
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
-        vastVideoConfiguration.addStartTrackers(Arrays.asList("start"));
+        vastVideoConfiguration.addAbsoluteTrackers(Arrays.asList(new VastAbsoluteProgressTracker("start", 2000)));
+        vastVideoConfiguration.addAbsoluteTrackers(Arrays.asList(new VastAbsoluteProgressTracker("later", 3000)));
         bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
-        stub(mediaPlayer.getDuration()).toReturn(100000);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(1000);
+        stub(mockMediaPlayer.getDuration()).toReturn(100000);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(2000);
 
         initializeSubject();
         subject.onResume();
-        setMediaPlayer(mediaPlayer);
-        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(2);
+        setMockMediaPlayer(mockMediaPlayer);
+        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
 
         Robolectric.getUiThreadScheduler().unPause();
-        Robolectric.getBackgroundScheduler().unPause();
 
-        Thread.sleep(NETWORK_DELAY);
-
-        assertHttpRequestsMade(expectedUserAgent, "start");
-        Robolectric.getFakeHttpLayer().clearRequestInfos();
+        verify(mockRequestQueue).add(argThat(isUrl("start")));
 
         // run checker another time
         assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
         Robolectric.getUiThreadScheduler().runOneTask();
 
-        Thread.sleep(NETWORK_DELAY);
-
-        assertThat(Robolectric.httpRequestWasMade()).isFalse();
+        verifyNoMoreInteractions(mockRequestQueue);
     }
 
     @Test
     public void videoProgressCheckerRunnableRun_whenProgressIsPastFirstQuartile_shouldOnlyPingFirstQuartileTrackersOnce() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(100);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(26);
+        stub(mockMediaPlayer.getDuration()).toReturn(100);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(26);
 
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
-        vastVideoConfiguration.addFirstQuartileTrackers(Arrays.asList("first"));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("first", 0.25f)));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("don't call", 0.28f)));
         bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
         initializeSubject();
         subject.onResume();
-        setMediaPlayer(mediaPlayer);
-        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(2);
+        setMockMediaPlayer(mockMediaPlayer);
+        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
 
         Robolectric.getUiThreadScheduler().unPause();
-        Robolectric.getBackgroundScheduler().unPause();
-        Thread.sleep(NETWORK_DELAY);
 
-        assertHttpRequestsMade(expectedUserAgent, "first");
-        Robolectric.getFakeHttpLayer().clearRequestInfos();
+        verify(mockRequestQueue).add(argThat(isUrl("first")));
 
         // run checker another time
         Robolectric.getUiThreadScheduler().runOneTask();
-        Thread.sleep(NETWORK_DELAY);
 
-        assertThat(Robolectric.httpRequestWasMade()).isFalse();
+        verifyNoMoreInteractions(mockRequestQueue);
     }
 
     @Test
     public void videoProgressCheckerRunnableRun_whenProgressIsPastMidQuartile_shouldPingFirstQuartileTrackers_andMidQuartileTrackersBothOnlyOnce() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(100);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(51);
+        stub(mockMediaPlayer.getDuration()).toReturn(100);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(51);
 
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
-        vastVideoConfiguration.addFirstQuartileTrackers(Arrays.asList("first"));
-        vastVideoConfiguration.addMidpointTrackers(Arrays.asList("second"));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("first", 0.25f)));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("second", 0.5f)));
         bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
         initializeSubject();
         subject.onResume();
-        setMediaPlayer(mediaPlayer);
-        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(2);
+        setMockMediaPlayer(mockMediaPlayer);
+        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
 
         Robolectric.getUiThreadScheduler().unPause();
-        Robolectric.getBackgroundScheduler().unPause();
-        Thread.sleep(NETWORK_DELAY);
 
-        assertHttpRequestsMade(expectedUserAgent, "first", "second");
-        Robolectric.getFakeHttpLayer().clearRequestInfos();
+        verify(mockRequestQueue).add(argThat(isUrl("first")));
+        verify(mockRequestQueue).add(argThat(isUrl("second")));
 
         Robolectric.getUiThreadScheduler().runOneTask();
-        Thread.sleep(NETWORK_DELAY);
 
-        assertThat(Robolectric.httpRequestWasMade()).isFalse();
+        verifyNoMoreInteractions(mockRequestQueue);
     }
 
     @Test
     public void videoProgressCheckerRunnableRun_whenProgressIsPastThirdQuartile_shouldPingFirstQuartileTrackers_andMidQuartileTrackers_andThirdQuartileTrackersAllOnlyOnce() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(100);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(76);
+        stub(mockMediaPlayer.getDuration()).toReturn(100);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(76);
 
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
-        vastVideoConfiguration.addFirstQuartileTrackers(Arrays.asList("first"));
-        vastVideoConfiguration.addMidpointTrackers(Arrays.asList("second"));
-        vastVideoConfiguration.addThirdQuartileTrackers(Arrays.asList("third"));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("first", 0.25f)));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("second", 0.5f)));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("third", 0.75f)));
         bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
         initializeSubject();
         subject.onResume();
-        setMediaPlayer(mediaPlayer);
-        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(2);
+        setMockMediaPlayer(mockMediaPlayer);
+        assertThat(Robolectric.getUiThreadScheduler().enqueuedTaskCount()).isEqualTo(1);
 
         Robolectric.getUiThreadScheduler().unPause();
-        Robolectric.getBackgroundScheduler().unPause();
-        Thread.sleep(NETWORK_DELAY);
 
-        assertHttpRequestsMade(expectedUserAgent, "first", "second", "third");
-        Robolectric.getFakeHttpLayer().clearRequestInfos();
+        verify(mockRequestQueue).add(argThat(isUrl("first")));
+        verify(mockRequestQueue).add(argThat(isUrl("second")));
+        verify(mockRequestQueue).add(argThat(isUrl("third")));
 
         Robolectric.getUiThreadScheduler().runOneTask();
-        Thread.sleep(NETWORK_DELAY);
 
-        assertThat(Robolectric.httpRequestWasMade()).isFalse();
+        verifyNoMoreInteractions(mockRequestQueue);
     }
 
     @Test
     public void videoProgressCheckerRunnableRun_asVideoPlays_shouldPingAllThreeTrackersIndividuallyOnce() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(100);
+        stub(mockMediaPlayer.getDuration()).toReturn(100);
 
         VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
         vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
-        vastVideoConfiguration.addFirstQuartileTrackers(Arrays.asList("first"));
-        vastVideoConfiguration.addMidpointTrackers(Arrays.asList("second"));
-        vastVideoConfiguration.addThirdQuartileTrackers(Arrays.asList("third"));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("first", 0.25f)));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("second", 0.5f)));
+        vastVideoConfiguration.addFractionalTrackers(Arrays.asList(new VastFractionalProgressTracker("third", 0.75f)));
         bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
 
         initializeSubject();
         subject.onResume();
-        setMediaPlayer(mediaPlayer);
+        setMockMediaPlayer(mockMediaPlayer);
 
         // before any trackers are fired
         fastForwardMediaPlayerAndAssertRequestMade(1);
@@ -966,17 +1373,70 @@ public class VastVideoViewControllerTest {
 
     @Test
     public void videoProgressCheckerRunnableRun_whenCurrentPositionIsGreaterThanShowCloseButtonDelay_shouldShowCloseButton() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(5002);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(5001);
+        stub(mockMediaPlayer.getDuration()).toReturn(5002);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(5001);
 
         initializeSubject();
         subject.onResume();
-        setMediaPlayer(mediaPlayer);
+        setMockMediaPlayer(mockMediaPlayer);
 
         assertThat(subject.isShowCloseButtonEventFired()).isFalse();
         Robolectric.getUiThreadScheduler().unPause();
 
         assertThat(subject.isShowCloseButtonEventFired()).isTrue();
+    }
+
+    @Test
+    public void videoProgressCheckerRunnableRun_whenCurrentPositionIsGreaterThanSkipOffset_shouldShowCloseButton() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("25%");    // skipoffset is at 2.5s
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        // duration is 10s
+        stub(mockMediaPlayer.getDuration()).toReturn(10 * 1000);
+
+        // current position is 1 ms after skipoffset
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(2501);
+
+        initializeSubject();
+        subject.onResume();
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(2500);
+        assertThat(subject.getHasSkipOffset()).isTrue();
+
+        assertThat(subject.isShowCloseButtonEventFired()).isFalse();
+        Robolectric.getUiThreadScheduler().unPause();
+
+        assertThat(subject.isShowCloseButtonEventFired()).isTrue();
+    }
+
+    @Test
+    public void videoProgressCheckerRunnableRun_whenCurrentPositionIsLessThanSkipOffset_shouldNotShowCloseButton() throws Exception {
+        VastVideoConfiguration vastVideoConfiguration = new VastVideoConfiguration();
+        vastVideoConfiguration.setDiskMediaFileUrl("disk_video_path");
+        vastVideoConfiguration.setSkipOffset("00:00:03");   // skipoffset is at 3s
+        bundle.putSerializable(VAST_VIDEO_CONFIGURATION, vastVideoConfiguration);
+
+        stub(mockMediaPlayer.getDuration()).toReturn(10 * 1000);    // duration is 10s
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(2999);  // current position is 1ms before skipoffset
+
+        initializeSubject();
+        subject.onResume();
+        setMockMediaPlayer(mockMediaPlayer);
+
+        getShadowVideoView().getOnPreparedListener().onPrepared(null);
+
+        assertThat(subject.getShowCloseButtonDelay()).isEqualTo(3000);
+        assertThat(subject.getHasSkipOffset()).isTrue();
+
+        assertThat(subject.isShowCloseButtonEventFired()).isFalse();
+        Robolectric.getUiThreadScheduler().unPause();
+
+        assertThat(subject.isShowCloseButtonEventFired()).isFalse();
     }
 
     @Test
@@ -1040,16 +1500,16 @@ public class VastVideoViewControllerTest {
     @Ignore("pending")
     @Test
     public void onResume_shouldSeekToPrePausedPosition() throws Exception {
-        stub(mediaPlayer.getDuration()).toReturn(10000);
-        stub(mediaPlayer.getCurrentPosition()).toReturn(7000);
+        stub(mockMediaPlayer.getDuration()).toReturn(10000);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(7000);
 
         initializeSubject();
-        setMediaPlayer(mediaPlayer);
+        setMockMediaPlayer(mockMediaPlayer);
         final VideoView videoView = spy(subject.getVideoView());
 
         subject.onPause();
 
-        stub(mediaPlayer.getCurrentPosition()).toReturn(1000);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(1000);
 
         subject.onResume();
         verify(videoView).seekTo(eq(7000));
@@ -1071,13 +1531,29 @@ public class VastVideoViewControllerTest {
         assertThat(subject.backButtonEnabled()).isTrue();
     }
 
+    @Test
+    public void onClickCloseButton_whenCloseButtonIsVisible_shouldFireCloseTrackers() {
+        initializeSubject();
+
+        subject.setCloseButtonVisible(true);
+
+        // We don't have direct access to the CloseButtonWidget's close event, so we manually
+        // invoke its onTouchListener's onTouch callback with a fake MotionEvent.ACTION_UP action.
+        View.OnTouchListener closeButtonOnTouchListener =
+                shadowOf(getVastVideoToolbar().getCloseButtonWidget()).getOnTouchListener();
+        closeButtonOnTouchListener.onTouch(null, GestureUtils.createActionUp(0, 0));
+
+        verify(mockRequestQueue).add(argThat(isUrl("close")));
+        verify(mockRequestQueue).add(argThat(isUrl("skip")));
+    }
+
     private void initializeSubject() {
         subject = new VastVideoViewController(context, bundle, testBroadcastIdentifier, baseVideoViewControllerListener);
     }
 
-    private void setMediaPlayer(final MediaPlayer mediaPlayer) throws IllegalAccessException {
+    private void setMockMediaPlayer(final MediaPlayer mockMediaPlayer) throws IllegalAccessException {
         final VideoView videoView = subject.getVideoView();
-        ReflectionUtils.setVariableValueInObject(videoView, "mMediaPlayer", mediaPlayer);
+        ReflectionUtils.setVariableValueInObject(videoView, "mMediaPlayer", mockMediaPlayer);
 
         int state = (Integer) ReflectionUtils.getValueIncludingSuperclasses("STATE_PLAYING", videoView);
 
@@ -1085,15 +1561,13 @@ public class VastVideoViewControllerTest {
     }
 
     private void fastForwardMediaPlayerAndAssertRequestMade(int time, String... urls) throws Exception {
-        stub(mediaPlayer.getCurrentPosition()).toReturn(time);
+        stub(mockMediaPlayer.getCurrentPosition()).toReturn(time);
         Robolectric.getUiThreadScheduler().unPause();
         Robolectric.getBackgroundScheduler().unPause();
         Thread.sleep(NETWORK_DELAY);
 
-        if (urls == null) {
-            assertThat(Robolectric.getNextSentHttpRequest()).isNull();
-        } else {
-            assertHttpRequestsMade(expectedUserAgent, urls);
+        for (String url : urls) {
+            verify(mockRequestQueue).add(argThat(isUrl(url)));
         }
 
         Robolectric.getFakeHttpLayer().clearRequestInfos();
@@ -1115,5 +1589,26 @@ public class VastVideoViewControllerTest {
 
     private ShadowVideoView getShadowVideoView() {
         return shadowOf(subject.getVideoView());
+    }
+
+    public static void assertHttpRequestsMade(final String userAgent, final String... urls) {
+        final int numberOfReceivedHttpRequests = Robolectric.getFakeHttpLayer().getSentHttpRequestInfos().size();
+        assertThat(numberOfReceivedHttpRequests).isEqualTo(urls.length);
+
+        for (final String url : urls) {
+            assertThat(Robolectric.httpRequestWasMade(url)).isTrue();
+        }
+
+        if (userAgent != null) {
+            while (true) {
+                final HttpRequest httpRequest = Robolectric.getNextSentHttpRequest();
+                if (httpRequest == null) {
+                    break;
+                }
+
+                assertThat(httpRequest.getFirstHeader(USER_AGENT.getKey()).getValue())
+                        .isEqualTo(userAgent);
+            }
+        }
     }
 }
